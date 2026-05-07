@@ -1,0 +1,17 @@
+---
+description: Group schematic symbols by function (power, clock, etc.)
+globs: **/*.{kicad_sch,kicad_pcb,kicad_pro,kicad_prl,dsn,ses} **/fp-lib-table **/sym-lib-table
+alwaysApply: false
+---
+
+# Functional grouping in schematics
+
+- Group symbols **by function** and keep each group spatially coherent.
+- Common groups to separate:
+  - **Power** (input protection, regulators, decoupling)
+  - **Clock/Oscillator** (crystal/resonator, load caps, clock routing)
+  - **MCU/Core logic**
+  - **Interfaces** (USB/UART/I2C/SPI, connectors, level shifting)
+- Place each functional block in a dedicated **side/corner/area** of the schematic page.
+- Keep inter-block connections tidy and minimal; use labels when it improves readability.
+

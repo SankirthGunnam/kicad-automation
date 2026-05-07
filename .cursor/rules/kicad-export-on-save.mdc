@@ -1,0 +1,14 @@
+---
+description: After saving schematic/PCB, export SVG and PDF
+globs: **/*.{kicad_sch,kicad_pcb,kicad_pro,kicad_prl,dsn,ses} **/fp-lib-table **/sym-lib-table
+alwaysApply: false
+---
+
+# Always export after save
+
+- After saving **schematic** (`.kicad_sch`) or **PCB** (`.kicad_pcb`) changes, also export:
+  - **SVG**
+  - **PDF**
+- Treat exports as part of “done” for any schematic/PCB edit (so reviewers can view diffs/artifacts).
+- If an export path is needed, prefer a consistent folder like `exports/` at the project root.
+

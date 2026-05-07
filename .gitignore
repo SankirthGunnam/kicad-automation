@@ -1,0 +1,30 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+.venv/
+venv/
+
+# Editors / IDEs
+.history/
+.idea/
+.vscode/
+.claude/
+
+# KiCad runtime artifacts
+*.kicad_prl
+*.kicad_pcb-bak
+*.bak
+
+# KiCad lock files (created while project is open)
+~*.lck
+
+# Auto-created by apply_routes_to_kicad_sch.py and KiCad MCP snapshots
+*-backups/
+
+# KiCad caches
+fp-info-cache

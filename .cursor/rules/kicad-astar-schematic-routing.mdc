@@ -1,0 +1,71 @@
+---
+description: A* schematic autorouting workflow for KiCad .kicad_sch
+alwaysApply: true
+---
+
+# KiCad schematic autorouting (A*) — project workflow
+
+When working on KiCad schematic autorouting in this repo, follow this workflow:
+
+## 1) Inputs & outputs (overwrite with backup)
+
+- Default behavior is to **overwrite the original** `.kicad_sch` after routing.
+- **Before overwriting**, always create a timestamped backup in a sibling folder, e.g.:
+  - `./<project>-backups/<schematic>.YYYYMMDD-HHMMSS.bak`
+- Optionally also write `*-routed.kicad_sch` during development, but the final step should replace the original (after backup).
+
+## 2) What to extract from `.kicad_sch`
+
+- **Symbols**: instances (`(symbol (lib_id ...) (at x y rot) ...)`) including reference + value.
+- **Pins**: derive absolute pin locations using the library symbol pin `(at ...)` offsets + symbol rotation.
+- **Net intent** (in order of preference):
+  - **True connectivity**: wires/buses/junctions (when present)
+  - **Labels**: `label`, `global_label`, `hierarchical_label`
+  - Fallback (temporary): nearest-label snapping for generated schematics lacking wires
+
+## 3) Routing backend selection (native preferred)
+
+- Prefer the **native router** (`libastar.dylib` on macOS, `astar.dll` on Windows, `libastar.so` on Linux) when available.
+- Always provide a **Python fallback** A* implementation.
+- Expose a flag to force Python-only routing (e.g. `--no-native`) for debugging/regressions.
+
+## 4) Grid model (schematic-space)
+
+- Use a 4-neighbor grid (Manhattan) for routing.
+- The schematic **must** be discretized into a grid:
+  - Choose `cell_mm` (grid resolution).
+  - Define global grid origin `ox, oy` and `cols, rows` to cover all routing points + obstacles + margin.
+- Define obstacles:
+  - Expanded symbol bounding boxes (+ padding) are blocked cells.
+  - Optionally block already-routed wires (or add congestion penalties).
+- For each net:
+  - Create a small connection set using MST (keeps wire count manageable).
+  - Route each edge with **A\***.
+  - Add penalties for turns and congested cells.
+
+## 5) Writing back to `.kicad_sch` (valid KiCad output)
+
+- Append generated wires as top-level:
+  - `(wire (pts (xy x1 y1) (xy x2 y2)) (stroke ...) (uuid "..."))`
+- Add `(junction ...)` where 3+ wires meet, if needed for KiCad connectivity semantics.
+- Preserve existing labels/symbols/metadata; only add routing primitives.
+- If overwriting: **backup first**, then replace the original file.
+
+## 6) Determinism & debugability
+
+- Prefer deterministic routing:
+  - stable net ordering
+  - stable MST tie-breaking
+  - fixed grid size defaults
+- Provide progress prints:
+  - counts of symbols/labels/nets
+  - per-net routing progress and timing
+  - explicitly log which backend was used (native vs python)
+
+## 7) Safety checks
+
+- If the produced file can’t be opened by KiCad, treat it as a **bug in the emitter**:
+  - validate parentheses balance
+  - ensure UUID fields exist where required
+  - ensure wire endpoints are numeric and well-formed
+

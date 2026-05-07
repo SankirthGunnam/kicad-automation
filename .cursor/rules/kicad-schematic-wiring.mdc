@@ -1,0 +1,12 @@
+---
+description: KiCad schematic wiring: orthogonal connections
+globs: **/*.{kicad_sch,kicad_pcb,kicad_pro,kicad_prl,dsn,ses} **/fp-lib-table **/sym-lib-table
+alwaysApply: false
+---
+
+# KiCad schematic wiring
+
+- Route **orthogonal connections only** (horizontal/vertical). Avoid diagonal wires.
+- Use consistent right-angle corners (prefer explicit wire segments instead of “almost straight” angles).
+- Add junction dots where needed; don’t rely on overlapping graphics to imply connectivity.
+

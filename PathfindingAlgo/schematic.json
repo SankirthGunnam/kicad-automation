@@ -1,0 +1,203 @@
+{
+  "scene": {
+    "rect": [
+      639,
+      309,
+      651,
+      1159
+    ]
+  },
+  "components": [
+    {
+      "id": 1,
+      "type": "rf_component",
+      "label": "#PWRc9f8",
+      "color": [
+        120,
+        120,
+        120
+      ],
+      "w": 100,
+      "h": 100,
+      "x": 990,
+      "y": 609,
+      "pins": [
+        [
+          "right",
+          "1"
+        ]
+      ],
+      "comment": "power:VCC"
+    },
+    {
+      "id": 2,
+      "type": "rf_component",
+      "label": "R1",
+      "color": [
+        160,
+        100,
+        200
+      ],
+      "w": 100,
+      "h": 176,
+      "x": 990,
+      "y": 787,
+      "pins": [
+        [
+          "right",
+          "1"
+        ],
+        [
+          "right",
+          "2"
+        ]
+      ],
+      "comment": "Device:R"
+    },
+    {
+      "id": 3,
+      "type": "rf_component",
+      "label": "#PWRff29",
+      "color": [
+        120,
+        120,
+        120
+      ],
+      "w": 100,
+      "h": 100,
+      "x": 990,
+      "y": 1168,
+      "pins": [
+        [
+          "right",
+          "1"
+        ]
+      ],
+      "comment": "power:GND"
+    },
+    {
+      "id": 4,
+      "type": "rf_component",
+      "label": "D1",
+      "color": [
+        160,
+        100,
+        200
+      ],
+      "w": 176,
+      "h": 100,
+      "x": 990,
+      "y": 990,
+      "pins": [
+        [
+          "left",
+          "1"
+        ],
+        [
+          "right",
+          "2"
+        ]
+      ],
+      "comment": "Device:LED"
+    },
+    {
+      "id": 5,
+      "type": "rf_component",
+      "label": "#FLG01",
+      "color": [
+        120,
+        120,
+        120
+      ],
+      "w": 100,
+      "h": 100,
+      "x": 939,
+      "y": 609,
+      "pins": [
+        [
+          "right",
+          "1"
+        ]
+      ],
+      "comment": "power:PWR_FLAG"
+    },
+    {
+      "id": 6,
+      "type": "rf_component",
+      "label": "#FLG02",
+      "color": [
+        120,
+        120,
+        120
+      ],
+      "w": 100,
+      "h": 100,
+      "x": 939,
+      "y": 1168,
+      "pins": [
+        [
+          "right",
+          "1"
+        ]
+      ],
+      "comment": "power:PWR_FLAG"
+    }
+  ],
+  "connections": [
+    {
+      "from": [
+        1,
+        "1"
+      ],
+      "to": [
+        2,
+        "2"
+      ],
+      "label": "N$$1"
+    },
+    {
+      "from": [
+        2,
+        "2"
+      ],
+      "to": [
+        5,
+        "1"
+      ],
+      "label": "N$$1"
+    },
+    {
+      "from": [
+        6,
+        "1"
+      ],
+      "to": [
+        4,
+        "2"
+      ],
+      "label": "N$$2"
+    },
+    {
+      "from": [
+        4,
+        "2"
+      ],
+      "to": [
+        3,
+        "1"
+      ],
+      "label": "N$$2"
+    },
+    {
+      "from": [
+        2,
+        "1"
+      ],
+      "to": [
+        4,
+        "1"
+      ],
+      "label": "N$$3"
+    }
+  ]
+}

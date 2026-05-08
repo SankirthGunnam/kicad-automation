@@ -16,6 +16,9 @@ from PySide6.QtGui import (
     QPen, QBrush, QColor, QPainter, QPainterPath, QFont, QTransform
 )
 
+import schematic_data
+from schematic_data import Schematic, Component, Connection
+
 # ── Constants ────────────────────────────────────────────────────────────────
 
 WIRE_COLOR   = QColor(0, 0, 0)
@@ -28,7 +31,15 @@ SNAP_GRID    = GRID_MINOR
 
 CELL_SIZE          = 0.635   # A* router cell size in mm (~25 mil)
 COMP_PAD_CELLS     = 1
-PIN_EXIT_CELLS     = 2
+# Extra clearance around the component bbox when building RouterGrid (mm-ish padding).
+ROUTING_BOUNDARY_PAD_CELLS = 2
+# When True, A* starts/ends at a point PIN_EXIT_CELLS outside the symbol so the pin
+# cell (inside the blocked pad) is never expanded from. That yields a short straight
+# “stub” before the Manhattan path and can look like a kink at the pin.
+# When False, endpoints are the pin centers; start/end grid cells stay traversable via
+# exclude (Python + native A*) so wires meet pins directly.
+PIN_EXIT_CELLS          = 2
+USE_PIN_APPROACH_EXITS = False
 TURN_PENALTY       = 4
 CONGESTION_PENALTY = 30
 
@@ -45,7 +56,7 @@ class RouterGrid:
             return
 
         pad_px = COMP_PAD_CELLS * CELL_SIZE
-        margin  = PIN_EXIT_CELLS * CELL_SIZE * 4
+        margin = ROUTING_BOUNDARY_PAD_CELLS * CELL_SIZE * 4
 
         min_x = min(c.pos().x() for c in components) - pad_px - margin
         min_y = min(c.pos().y() for c in components) - pad_px - margin
@@ -93,6 +104,14 @@ class RouterGrid:
 
 
 _DIRS = ((-1, 0), (1, 0), (0, -1), (0, 1))
+
+# (delta_row, delta_col) — escape opposite symbol interior along pin facing direction
+_PIN_TUNNEL_DELTA: dict[str, tuple[int, int]] = {
+    "left": (0, -1),
+    "right": (0, 1),
+    "top": (-1, 0),
+    "bottom": (1, 0),
+}
 
 # ── C++ A* DLL ────────────────────────────────────────────────────────────────
 
@@ -195,12 +214,19 @@ def _astar_route_cpp(grid, start: QPointF, end: QPointF):
     return [QPointF(out_x[i], out_y[i]) for i in range(n)]
 
 
-def _astar_route_py(grid, start: QPointF, end: QPointF):
+def _astar_route_py(
+    grid,
+    start: QPointF,
+    end: QPointF,
+    exclude_cells: frozenset | None = None,
+):
     sr, sc = grid.world_to_cell(start.x(), start.y())
     er, ec = grid.world_to_cell(end.x(), end.y())
     if (sr, sc) == (er, ec):
         return [start, end]
-    exclude = frozenset({(sr, sc), (er, ec)})
+    exclude: frozenset[tuple[int, int]] = frozenset({(sr, sc), (er, ec)})
+    if exclude_cells:
+        exclude = exclude | exclude_cells
 
     def h(r, c): return abs(r - er) + abs(c - ec)
 
@@ -236,10 +262,27 @@ def _astar_route_py(grid, start: QPointF, end: QPointF):
     return None
 
 
-def astar_route(grid, start: QPointF, end: QPointF):
-    if _dll_available:
-        return _astar_route_cpp(grid, start, end)
-    return _astar_route_py(grid, start, end)
+def astar_route(
+    grid,
+    start: QPointF,
+    end: QPointF,
+    exclude_cells: frozenset | None = None,
+):
+    """
+    Native astar_route does not accept extra traversable cells; when routing from
+    pin centres (USE_PIN_APPROACH_EXITS False) we need a short outbound tunnel
+    through the padded obstacle — handled only in Python.
+    """
+    use_cpp = (
+        _dll_available
+        and USE_PIN_APPROACH_EXITS
+        and exclude_cells is None
+    )
+    if use_cpp:
+        out = _astar_route_cpp(grid, start, end)
+        if out is not None:
+            return out
+    return _astar_route_py(grid, start, end, exclude_cells)
 
 
 def simplify_path(pts):
@@ -256,8 +299,29 @@ def simplify_path(pts):
     return result
 
 
+def pin_tunnel_exclude_cells(grid: RouterGrid, pin) -> frozenset[tuple[int, int]]:
+    """
+    Cells treated as non-blocked so A* can leave a pin that sits inside the
+    component padding. Same extent as PIN_EXIT_CELLS, without changing the
+    geometric path origin (pin centre).
+    """
+    p = pin.scene_pos()
+    r, c = grid.world_to_cell(p.x(), p.y())
+    cells: set[tuple[int, int]] = {(r, c)}
+    dr, dc = _PIN_TUNNEL_DELTA.get(pin.side, (0, 0))
+    cr, cc = r, c
+    for _ in range(PIN_EXIT_CELLS):
+        cr += dr
+        cc += dc
+        cells.add((cr, cc))
+    return frozenset(cells)
+
+
 def pin_exit_point(pin) -> QPointF:
-    p   = pin.scene_pos()
+    """Routing endpoint in scene coords — pin center, or approach point outside symbol."""
+    p = pin.scene_pos()
+    if not USE_PIN_APPROACH_EXITS:
+        return p
     off = PIN_EXIT_CELLS * CELL_SIZE
     return {
         'right':  QPointF(p.x() + off, p.y()),
@@ -418,14 +482,37 @@ class ComponentItem(QGraphicsItem):
 class RFComponentItem(ComponentItem):
     """Component with explicitly named pins. pin_spec = [(side, name), ...]"""
 
-    def __init__(self, comp_id, comp_type, color, w, h, pin_spec):
+    def __init__(self, comp_id, comp_type, color, w, h, pin_spec, pin_xy=None):
         super().__init__(comp_id, comp_type, color)
         self.w = w
         self.h = h
         self.pin_names: dict[int, str] = {}
-        self._build_named_pins(pin_spec)
+        self._build_named_pins(pin_spec, pin_xy)
 
-    def _build_named_pins(self, pin_spec):
+    def boundingRect(self):
+        base = QRectF(-4, -4, self.w + 8, self.h + 8)
+        if not self.pins:
+            return base
+        margin = PinItem.SIZE / 2 + 3
+        for pin in self.pins:
+            p = pin.pos()
+            base = base.united(QRectF(p.x() - margin, p.y() - margin,
+                                      2 * margin, 2 * margin))
+        return base
+
+    def _build_named_pins(self, pin_spec, pin_xy=None):
+        if (
+            pin_xy is not None
+            and len(pin_xy) == len(pin_spec)
+        ):
+            for pid, ((side, name), (px, py)) in enumerate(zip(pin_spec, pin_xy)):
+                pin = PinItem(pid, side, self)
+                pin.setParentItem(self)
+                pin.setPos(float(px), float(py))
+                self.pins.append(pin)
+                self.pin_names[pid] = name
+            return
+
         by_side = defaultdict(list)
         for side, name in pin_spec:
             by_side[side].append(name)
@@ -616,6 +703,29 @@ class AntennaItem(QGraphicsItem):
         return super().itemChange(change, value)
 
 
+def snap_waypoints_to_pins(pin1: PinItem, pin2: PinItem, waypoints: list[QPointF]) -> list[QPointF]:
+    """
+    A* cell centres rarely share X or Y with the pin they leave. Without snapping,
+    the segment pin→first waypoint is diagonal (zig-zag in KiCad). Mirror the fix
+    used when drawing routes in the viewer.
+    """
+    if not waypoints:
+        return []
+    wpts = list(waypoints)
+    p1 = pin1.scene_pos()
+    p2 = pin2.scene_pos()
+    if pin1.side in ("left", "right"):
+        wpts[0] = QPointF(wpts[0].x(), p1.y())
+    else:
+        wpts[0] = QPointF(p1.x(), wpts[0].y())
+    if len(wpts) >= 2:
+        if pin2.side in ("left", "right"):
+            wpts[-1] = QPointF(wpts[-1].x(), p2.y())
+        else:
+            wpts[-1] = QPointF(p2.x(), wpts[-1].y())
+    return wpts
+
+
 # ── Connection ────────────────────────────────────────────────────────────────
 
 class ConnectionItem(QGraphicsPathItem):
@@ -640,23 +750,13 @@ class ConnectionItem(QGraphicsPathItem):
             self._draw_bezier()
 
     def _draw_routed(self):
-        # self.pin1.rect().center()
         p1 = self.pin1.scene_pos()
         p2 = self.pin2.scene_pos()
-        wpts = list(self._waypoints) if self._waypoints else []
-
-        # Fix small bend: snap first waypoint's transverse axis to match pin position
-        if wpts:
-            if self.pin1.side in ('left', 'right'):
-                wpts[0] = QPointF(wpts[0].x(), p1.y())
-            else:
-                wpts[0] = QPointF(p1.x(), wpts[0].y())
-
-        if len(wpts) >= 2:
-            if self.pin2.side in ('left', 'right'):
-                wpts[-1] = QPointF(wpts[-1].x(), p2.y())
-            else:
-                wpts[-1] = QPointF(p2.x(), wpts[-1].y())
+        wpts = (
+            snap_waypoints_to_pins(self.pin1, self.pin2, list(self._waypoints))
+            if self._waypoints
+            else []
+        )
 
         path = QPainterPath(p1)
         for pt in wpts:
@@ -700,47 +800,44 @@ class ConnectionItem(QGraphicsPathItem):
 
 # ── Auto Layout ───────────────────────────────────────────────────────────────
 
-def compute_auto_layout(data: dict) -> dict:
+def compute_auto_layout(sch: Schematic) -> dict:
     """
     Assign pixel positions to components using pin-side connectivity.
     Returns {comp_id: (x, y)}.
 
     Column rank: right→left edges mean left-to-right flow (col[from] < col[to]).
                  left→right edges mean right-to-left flow (col[to] < col[from]).
-    Connections with "layout": false are ignored for placement.
+    Connections with layout=False are ignored for placement.
     """
     pin_sides: dict[tuple, str] = {}
     comp_dims:  dict[int, tuple] = {}
 
-    for c in data["components"]:
-        cid = c["id"]
-        if c["type"] == "rfic":
+    for c in sch.components:
+        if c.type == "rfic":
             for side, name in _RFIC_PINS:
-                pin_sides[(cid, name)] = side
-            comp_dims[cid] = (160, 300)
-        elif c["type"] == "antenna":
-            pin_sides[(cid, "FEED")] = "left"
-            comp_dims[cid] = (80, 140)
+                pin_sides[(c.id, name)] = side
+            comp_dims[c.id] = (160, 300)
+        elif c.type == "antenna":
+            pin_sides[(c.id, "FEED")] = "left"
+            comp_dims[c.id] = (80, 140)
         else:
-            for side, name in c["pins"]:
-                pin_sides[(cid, name)] = side
-            comp_dims[cid] = (c["w"], c["h"])
+            for side, name in c.pins:
+                pin_sides[(c.id, name)] = side
+            comp_dims[c.id] = (c.w, c.h)
 
-    all_ids = [c["id"] for c in data["components"]]
+    all_ids = [c.id for c in sch.components]
 
     # adj[A] = {B} means col[A] < col[B]
     adj: dict[int, set] = {cid: set() for cid in all_ids}
-    for conn in data["connections"]:
-        if conn.get("layout") is False:
+    for conn in sch.connections:
+        if not conn.layout:
             continue
-        fid, fpin = conn["from"]
-        tid, tpin = conn["to"]
-        fs = pin_sides.get((fid, fpin))
-        ts = pin_sides.get((tid, tpin))
+        fs = pin_sides.get((conn.from_id, conn.from_pin))
+        ts = pin_sides.get((conn.to_id,   conn.to_pin))
         if fs == "right" and ts == "left":
-            adj[fid].add(tid)
+            adj[conn.from_id].add(conn.to_id)
         elif fs == "left" and ts == "right":
-            adj[tid].add(fid)
+            adj[conn.to_id].add(conn.from_id)
 
     # Longest-path column ranks via Kahn's algorithm
     in_deg: dict[int, int] = {cid: 0 for cid in all_ids}
@@ -771,13 +868,11 @@ def compute_auto_layout(data: dict) -> dict:
 
     # Neighbor lookup for barycenter (layout connections only)
     nbrs: dict[int, list] = defaultdict(list)
-    for conn in data["connections"]:
-        if conn.get("layout") is False:
+    for conn in sch.connections:
+        if not conn.layout:
             continue
-        fid, _ = conn["from"]
-        tid, _ = conn["to"]
-        nbrs[fid].append(tid)
-        nbrs[tid].append(fid)
+        nbrs[conn.from_id].append(conn.to_id)
+        nbrs[conn.to_id].append(conn.from_id)
 
     # Barycenter row ordering
     for _ in range(5):
@@ -827,14 +922,14 @@ class CADScene(QGraphicsScene):
     def __init__(self, schema_file: str | None = None):
         super().__init__()
         self.schema_file = schema_file or self.DEFAULT_SCHEMA_FILE
-        self._data = self._load_schema()
-        r = self._data["scene"]["rect"]
+        self._sch: Schematic = self._load_schema()
+        r = self._sch.scene_rect
         self.setSceneRect(r[0], r[1], r[2], r[3])
         self.components:  list = []
         self.connections: list[ConnectionItem] = []
         self._needs_reroute = False
         self._dirty_components: set = set()
-        self._populate(self._data)
+        self._populate(self._sch)
         self.route_all()
 
     # ── helpers ───────────────────────────────────────────────────────────────
@@ -855,58 +950,51 @@ class CADScene(QGraphicsScene):
 
     # ── JSON schema loader ────────────────────────────────────────────────────
 
-    def _load_schema(self) -> dict:
-        with open(self.schema_file, "r", encoding="utf-8") as f:
-            return json.load(f)
+    def _load_schema(self) -> Schematic:
+        return schematic_data.load(self.schema_file)
 
-    # ── Populate from JSON ────────────────────────────────────────────────────
+    # ── Populate from Schematic dataclass ─────────────────────────────────────
 
-    def _populate(self, data: dict, positions: dict | None = None):
+    def _populate(self, sch: Schematic, positions: dict | None = None):
         comp_map: dict[int, object] = {}
 
         if positions is None:
-            # Prefer explicit per-component x/y from the JSON when every component
-            # has them; otherwise fall back to the column/barycenter auto-layout.
-            comps = data["components"]
-            if comps and all("x" in c and "y" in c for c in comps):
-                positions = {c["id"]: (c["x"], c["y"]) for c in comps}
+            # Prefer explicit per-component x/y when every component carries
+            # one; otherwise fall back to the column/barycenter auto-layout.
+            if sch.components and all(c.has_position() for c in sch.components):
+                positions = {c.id: (c.x, c.y) for c in sch.components}
             else:
-                positions = compute_auto_layout(data)
+                positions = compute_auto_layout(sch)
 
-        for c in data["components"]:
-            cid  = c["id"]
-            kind = c["type"]
-
-            if kind == "rfic":
-                item = RFICItem(cid)
-            elif kind == "antenna":
-                item = AntennaItem(cid)
+        for c in sch.components:
+            if c.type == "rfic":
+                item = RFICItem(c.id)
+            elif c.type == "antenna":
+                item = AntennaItem(c.id)
             else:
                 item = RFComponentItem(
-                    cid,
-                    c["label"],
-                    QColor(*c["color"]),
-                    w=c["w"], h=c["h"],
-                    pin_spec=[tuple(p) for p in c["pins"]],
+                    c.id,
+                    c.label,
+                    QColor(*c.color),
+                    w=c.w, h=c.h,
+                    pin_spec=[tuple(p) for p in c.pins],
+                    pin_xy=c.pin_xy,
                 )
 
-            x, y = positions.get(cid, (c.get("x", 0), c.get("y", 0)))
+            x, y = positions.get(c.id, (c.x, c.y))
             item.setPos(x, y)
             self._add_comp(item)
-            comp_map[cid] = item
+            comp_map[c.id] = item
 
-        for conn in data["connections"]:
-            from_id, from_pin = conn["from"]
-            to_id,   to_pin   = conn["to"]
-            label = conn.get("label", "")
+        for conn in sch.connections:
             self._connect(
-                comp_map[from_id].get_pin(from_pin),
-                comp_map[to_id].get_pin(to_pin),
-                label,
+                comp_map[conn.from_id].get_pin(conn.from_pin),
+                comp_map[conn.to_id].get_pin(conn.to_pin),
+                conn.label,
             )
 
     def auto_layout(self):
-        positions = compute_auto_layout(self._data)
+        positions = compute_auto_layout(self._sch)
         self._needs_reroute = False
         self._dirty_components = set()
         for comp in self.components:
@@ -934,9 +1022,11 @@ class CADScene(QGraphicsScene):
             c1, c2 = p1.parent_component, p2.parent_component
             sp, ep = p1.scene_pos(), p2.scene_pos()
 
-            # Routed polyline: pin1 endpoint, A* waypoints, pin2 endpoint.
+            # Routed polyline: pin1 endpoint, snapped A* waypoints, pin2 endpoint.
+            # Raw cell centres diagonalise pin→first segment if exported unchanged.
             if conn._waypoints:
-                pts = [sp] + list(conn._waypoints) + [ep]
+                w = snap_waypoints_to_pins(p1, p2, list(conn._waypoints))
+                pts = [sp] + w + [ep]
                 routed_n += 1
                 is_routed = True
             else:
@@ -1029,7 +1119,7 @@ class CADScene(QGraphicsScene):
 
         t0 = time.perf_counter()
 
-        if _route_all_dll and to_route:
+        if _route_all_dll and to_route and USE_PIN_APPROACH_EXITS:
             routed, fallback = self._route_all_cpp(grid, to_route, stable)
         else:
             # Python fallback
@@ -1039,8 +1129,16 @@ class CADScene(QGraphicsScene):
                                conn._waypoints, conn.pin2.scene_pos())
             routed = fallback = 0
             for conn in to_route:
-                path = astar_route(grid, pin_exit_point(conn.pin1),
-                                   pin_exit_point(conn.pin2))
+                tunnel = (
+                    pin_tunnel_exclude_cells(grid, conn.pin1)
+                    | pin_tunnel_exclude_cells(grid, conn.pin2)
+                )
+                path = astar_route(
+                    grid,
+                    pin_exit_point(conn.pin1),
+                    pin_exit_point(conn.pin2),
+                    tunnel if not USE_PIN_APPROACH_EXITS else None,
+                )
                 if path:
                     s = simplify_path(path)
                     conn.set_routed_path(s)

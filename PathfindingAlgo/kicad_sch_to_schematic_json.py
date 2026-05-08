@@ -295,6 +295,36 @@ def _round_pt(x: float, y: float, tol: float = 1e-6) -> tuple[float, float]:
     return (round(x / tol) * tol, round(y / tol) * tol)
 
 
+def _pin_name_net_candidates(pin_name: str) -> list[str]:
+    """
+    Map a KiCad symbol pin *name* to possible net / label strings.
+    Examples: "RST/VPP" -> ["RST/VPP", "RST", "VPP"]; "XTAL1" -> ["XTAL1"].
+    Passive pins named "~" yield nothing.
+    """
+    if not pin_name or pin_name == "~":
+        return []
+    raw = pin_name.strip()
+    out: list[str] = []
+    for part in raw.replace(",", "/").split("/"):
+        p = part.strip()
+        if p and p != "~" and p not in out:
+            out.append(p)
+    if raw not in out:
+        out.insert(0, raw)
+    return out
+
+
+def _supply_rail_aliases(net_name: str) -> list[str]:
+    """Map common supply pin names to KiCad rail label text (+5V / GND)."""
+    u = net_name.upper().replace(" ", "")
+    out = [net_name]
+    if u in ("VCC", "VDD", "VDDIO"):
+        out.append("+5V")
+    if u in ("VSS", "VEE"):
+        out.append("GND")
+    return out
+
+
 def _build_connectivity(
     symbols: list[SymbolInst],
     lib_pins: dict[str, list[LibPin]],
@@ -395,6 +425,368 @@ def _build_connectivity(
             else:
                 label_to_first_cc[lb] = i
 
+    # Map grid point -> CC index (each point belongs to exactly one comp before merges)
+    pt_to_cc: dict[tuple[float, float], int] = {}
+    for i, cc in enumerate(comps):
+        for pt in cc:
+            pt_to_cc[pt] = i
+
+    # Pin *name* ↔ net label: after stripping wires, MCU pins (XTAL1, RST/VPP, …)
+    # still match net labels by string even when the label sits on the same grid
+    # point only. Skip crystals: KiCad Device:Crystal uses pin *names* "1"/"2",
+    # which must not participate in name-based net merging.
+    for sym in symbols:
+        if ":Crystal" in sym.lib_id:
+            continue
+        pins = lib_pins.get(sym.lib_id, [])
+        for p in pins:
+            rx, ry = _rot(p.ox, p.oy, sym.rot_deg)
+            ax, ay = sym.x + rx, sym.y - ry
+            pt = _round_pt(ax, ay)
+            ip = pt_to_cc.get(pt)
+            if ip is None:
+                continue
+            seen_alias: set[str] = set()
+            for cand in _pin_name_net_candidates(p.name):
+                for alias in _supply_rail_aliases(cand):
+                    if alias in seen_alias:
+                        continue
+                    seen_alias.add(alias)
+                    for jq in range(len(comps)):
+                        if alias in cc_labels[jq]:
+                            union(ip, jq)
+
+    # Label positions by text (for crystal + load-cap heuristics)
+    label_xy_by_text: dict[str, list[tuple[float, float]]] = {}
+    for lb in labels:
+        label_xy_by_text.setdefault(lb.text, []).append(_round_pt(lb.x, lb.y))
+
+    # Two-pin crystal: map pins 1/2 to XTAL1 / XTAL2 label islands by proximity
+    for sym in symbols:
+        lid = sym.lib_id
+        if ":Crystal" not in lid:
+            continue
+        pins_d = {p.number: p for p in lib_pins.get(lid, [])}
+        if "1" not in pins_d or "2" not in pins_d:
+            continue
+
+        def ppt(num: str) -> tuple[float, float]:
+            pp = pins_d[num]
+            rx, ry = _rot(pp.ox, pp.oy, sym.rot_deg)
+            return _round_pt(sym.x + rx, sym.y - ry)
+
+        pt1, pt2 = ppt("1"), ppt("2")
+        if pt1 not in pt_to_cc or pt2 not in pt_to_cc:
+            continue
+        pos_xtal1 = label_xy_by_text.get("XTAL1")
+        pos_xtal2 = label_xy_by_text.get("XTAL2")
+        if not pos_xtal1 or not pos_xtal2:
+            continue
+        xa, xb = pos_xtal1[0], pos_xtal2[0]
+
+        def dist(pa: tuple[float, float], pb: tuple[float, float]) -> float:
+            return math.hypot(pa[0] - pb[0], pa[1] - pb[1])
+
+        # Pick assignment that minimizes total pin-to-label distance
+        if dist(pt1, xa) + dist(pt2, xb) <= dist(pt1, xb) + dist(pt2, xa):
+            u1, u2 = xa, xb
+        else:
+            u1, u2 = xb, xa
+        if u1 in pt_to_cc:
+            union(pt_to_cc[pt1], pt_to_cc[u1])
+        if u2 in pt_to_cc:
+            union(pt_to_cc[pt2], pt_to_cc[u2])
+
+    # Merged label sets per union-find root (after pin/crystal unions)
+    root_labels: dict[int, set[str]] = {}
+    for i in range(len(comps)):
+        r = find(i)
+        root_labels.setdefault(r, set()).update(cc_labels[i])
+
+    # Load caps (Device:C) next to crystal: one pin ties to GND — attach the other
+    # pin to the nearer XTAL1 / XTAL2 label island (wire-free sheets only).
+
+    for sym in symbols:
+        if sym.lib_id != "Device:C":
+            continue
+        plist = lib_pins.get(sym.lib_id, [])
+        if len(plist) != 2:
+            continue
+        pts: list[tuple[float, float]] = []
+        for p in plist:
+            rx, ry = _rot(p.ox, p.oy, sym.rot_deg)
+            pts.append(_round_pt(sym.x + rx, sym.y - ry))
+        if pts[0] not in pt_to_cc or pts[1] not in pt_to_cc:
+            continue
+        r0, r1 = find(pt_to_cc[pts[0]]), find(pt_to_cc[pts[1]])
+        if r0 == r1:
+            continue
+        for a, b in ((0, 1), (1, 0)):
+            la, lb_ = root_labels.get(find(pt_to_cc[pts[a]]), set()), root_labels.get(
+                find(pt_to_cc[pts[b]]), set()
+            )
+            # Only merge "floating" cap legs: the non-GND island must have no net
+            # labels yet. Otherwise reset caps (GND–RST) or supply bypass caps would
+            # wrongly glue those nets to XTAL1/XTAL2.
+            if "GND" in la and not lb_:
+                pb = pts[b]
+                best_root: int | None = None
+                best_d = 1e9
+                for xname in ("XTAL1", "XTAL2"):
+                    for lpt in label_xy_by_text.get(xname, []):
+                        if lpt not in pt_to_cc:
+                            continue
+                        d = math.hypot(pb[0] - lpt[0], pb[1] - lpt[1])
+                        if d < best_d:
+                            best_d = d
+                            best_root = find(pt_to_cc[lpt])
+                if best_root is not None:
+                    union(pt_to_cc[pb], best_root)
+                break
+
+    def _rebuild_root_labels() -> dict[int, set[str]]:
+        rl: dict[int, set[str]] = {}
+        for i in range(len(comps)):
+            r = find(i)
+            rl.setdefault(r, set()).update(cc_labels[i])
+        return rl
+
+    def _rail_root(net: str) -> int | None:
+        j = label_to_first_cc.get(net)
+        return find(j) if j is not None else None
+
+    def _rst_like(lbls: set[str]) -> bool:
+        for x in lbls:
+            u = x.upper()
+            if u == "RST" or u.startswith("RST/"):
+                return True
+        return False
+
+    def _collect_positions_for_root(target_r: int) -> list[tuple[float, float]]:
+        found: list[tuple[float, float]] = []
+        for sym in symbols:
+            for p in lib_pins.get(sym.lib_id, []):
+                rx, ry = _rot(p.ox, p.oy, sym.rot_deg)
+                pt = _round_pt(sym.x + rx, sym.y - ry)
+                if pt not in pt_to_cc:
+                    continue
+                if find(pt_to_cc[pt]) == target_r:
+                    found.append(pt)
+        return found
+
+    root_labels = _rebuild_root_labels()
+    gnd_r = _rail_root("GND")
+    vcc_r = _rail_root("+5V")
+    rst_r = _rail_root("RST")
+    crystal_syms = [s for s in symbols if ":Crystal" in s.lib_id]
+
+    def _crystal_pin_pt(sym_inst: SymbolInst, pin_number: str) -> tuple[float, float] | None:
+        pins_d = {p.number: p for p in lib_pins.get(sym_inst.lib_id, [])}
+        pp = pins_d.get(pin_number)
+        if pp is None:
+            return None
+        rx, ry = _rot(pp.ox, pp.oy, sym_inst.rot_deg)
+        return _round_pt(sym_inst.x + rx, sym_inst.y - ry)
+
+    _CRYSTAL_NEAR_MM = 30.0
+
+    # Crystal load caps without a GND label on the capacitor: tie the pin nearer the
+    # crystal terminal to that XTAL net and the opposite pin to GND (before decap heuristic).
+    if gnd_r is not None and crystal_syms:
+        ysym = crystal_syms[0]
+        cp1 = _crystal_pin_pt(ysym, "1")
+        cp2 = _crystal_pin_pt(ysym, "2")
+        if cp1 and cp2 and cp1 in pt_to_cc and cp2 in pt_to_cc:
+            cc_xtal1 = find(pt_to_cc[cp1])
+            cc_xtal2 = find(pt_to_cc[cp2])
+            for sym in symbols:
+                if sym.lib_id != "Device:C":
+                    continue
+                if math.hypot(sym.x - ysym.x, sym.y - ysym.y) >= _CRYSTAL_NEAR_MM:
+                    continue
+                plist = lib_pins.get(sym.lib_id, [])
+                if len(plist) != 2:
+                    continue
+                pts = []
+                for p in plist:
+                    rx, ry = _rot(p.ox, p.oy, sym.rot_deg)
+                    pts.append(_round_pt(sym.x + rx, sym.y - ry))
+                if pts[0] not in pt_to_cc or pts[1] not in pt_to_cc:
+                    continue
+                r0, r1 = find(pt_to_cc[pts[0]]), find(pt_to_cc[pts[1]])
+                if r0 == r1:
+                    continue
+                if root_labels.get(r0, set()) or root_labels.get(r1, set()):
+                    continue
+                d0 = min(
+                    math.hypot(pts[0][0] - cp1[0], pts[0][1] - cp1[1]),
+                    math.hypot(pts[0][0] - cp2[0], pts[0][1] - cp2[1]),
+                )
+                d1 = min(
+                    math.hypot(pts[1][0] - cp1[0], pts[1][1] - cp1[1]),
+                    math.hypot(pts[1][0] - cp2[0], pts[1][1] - cp2[1]),
+                )
+                i_xt = 0 if d0 <= d1 else 1
+                i_g = 1 - i_xt
+                cc_near = (
+                    cc_xtal1
+                    if math.hypot(
+                        pts[i_xt][0] - cp1[0], pts[i_xt][1] - cp1[1]
+                    )
+                    <= math.hypot(
+                        pts[i_xt][0] - cp2[0], pts[i_xt][1] - cp2[1]
+                    )
+                    else cc_xtal2
+                )
+                union(pt_to_cc[pts[i_xt]], cc_near)
+                union(pt_to_cc[pts[i_g]], gnd_r)
+        root_labels = _rebuild_root_labels()
+
+    # Crystal load caps: one leg already on XTAL1/XTAL2, other leg still unlabeled → GND
+    if gnd_r is not None:
+        for sym in symbols:
+            if sym.lib_id != "Device:C":
+                continue
+            plist = lib_pins.get(sym.lib_id, [])
+            if len(plist) != 2:
+                continue
+            pts: list[tuple[float, float]] = []
+            for p in plist:
+                rx, ry = _rot(p.ox, p.oy, sym.rot_deg)
+                pts.append(_round_pt(sym.x + rx, sym.y - ry))
+            if pts[0] not in pt_to_cc or pts[1] not in pt_to_cc:
+                continue
+            r0, r1 = find(pt_to_cc[pts[0]]), find(pt_to_cc[pts[1]])
+            if r0 == r1:
+                continue
+            l0, l1 = root_labels.get(r0, set()), root_labels.get(r1, set())
+            xt = {"XTAL1", "XTAL2"}
+            if (l0 & xt) and not l1:
+                union(pt_to_cc[pts[1]], gnd_r)
+            elif (l1 & xt) and not l0:
+                union(pt_to_cc[pts[0]], gnd_r)
+        root_labels = _rebuild_root_labels()
+
+    # Decoupling caps: both legs still unlabeled → tie nearer pin to +5V, other to GND
+    _DECAP_MAX_MM = 38.0
+    if gnd_r is not None and vcc_r is not None:
+        pv = _collect_positions_for_root(vcc_r)
+        pg = _collect_positions_for_root(gnd_r)
+        if pv and pg:
+            for sym in symbols:
+                if sym.lib_id != "Device:C":
+                    continue
+                if crystal_syms and math.hypot(
+                    sym.x - crystal_syms[0].x, sym.y - crystal_syms[0].y
+                ) < _CRYSTAL_NEAR_MM:
+                    continue
+                plist = lib_pins.get(sym.lib_id, [])
+                if len(plist) != 2:
+                    continue
+                pts = []
+                for p in plist:
+                    rx, ry = _rot(p.ox, p.oy, sym.rot_deg)
+                    pts.append(_round_pt(sym.x + rx, sym.y - ry))
+                if pts[0] not in pt_to_cc or pts[1] not in pt_to_cc:
+                    continue
+                r0, r1 = find(pt_to_cc[pts[0]]), find(pt_to_cc[pts[1]])
+                if r0 == r1:
+                    continue
+                l0, l1 = root_labels.get(r0, set()), root_labels.get(r1, set())
+                if l0 or l1:
+                    continue
+                d0v = min(math.hypot(pts[0][0] - x, pts[0][1] - y) for x, y in pv)
+                d1v = min(math.hypot(pts[1][0] - x, pts[1][1] - y) for x, y in pv)
+                d0g = min(math.hypot(pts[0][0] - x, pts[0][1] - y) for x, y in pg)
+                d1g = min(math.hypot(pts[1][0] - x, pts[1][1] - y) for x, y in pg)
+                if min(d0v, d1v, d0g, d1g) > _DECAP_MAX_MM:
+                    continue
+                if d0v + d1g <= d1v + d0g:
+                    union(pt_to_cc[pts[0]], vcc_r)
+                    union(pt_to_cc[pts[1]], gnd_r)
+                else:
+                    union(pt_to_cc[pts[1]], vcc_r)
+                    union(pt_to_cc[pts[0]], gnd_r)
+        root_labels = _rebuild_root_labels()
+
+    # Reset cap: one leg on RST, other unlabeled → GND
+    if gnd_r is not None and rst_r is not None:
+        for sym in symbols:
+            if sym.lib_id != "Device:C":
+                continue
+            plist = lib_pins.get(sym.lib_id, [])
+            if len(plist) != 2:
+                continue
+            pts = []
+            for p in plist:
+                rx, ry = _rot(p.ox, p.oy, sym.rot_deg)
+                pts.append(_round_pt(sym.x + rx, sym.y - ry))
+            if pts[0] not in pt_to_cc or pts[1] not in pt_to_cc:
+                continue
+            r0, r1 = find(pt_to_cc[pts[0]]), find(pt_to_cc[pts[1]])
+            if r0 == r1:
+                continue
+            l0, l1 = root_labels.get(r0, set()), root_labels.get(r1, set())
+            if _rst_like(l0) and not l1:
+                union(pt_to_cc[pts[1]], gnd_r)
+            elif _rst_like(l1) and not l0:
+                union(pt_to_cc[pts[0]], gnd_r)
+        root_labels = _rebuild_root_labels()
+
+    # Pull-up resistor: RST on one leg, other unlabeled → +5V
+    if vcc_r is not None and rst_r is not None:
+        for sym in symbols:
+            if sym.lib_id != "Device:R":
+                continue
+            plist = lib_pins.get(sym.lib_id, [])
+            if len(plist) != 2:
+                continue
+            pts = []
+            for p in plist:
+                rx, ry = _rot(p.ox, p.oy, sym.rot_deg)
+                pts.append(_round_pt(sym.x + rx, sym.y - ry))
+            if pts[0] not in pt_to_cc or pts[1] not in pt_to_cc:
+                continue
+            r0, r1 = find(pt_to_cc[pts[0]]), find(pt_to_cc[pts[1]])
+            if r0 == r1:
+                continue
+            l0, l1 = root_labels.get(r0, set()), root_labels.get(r1, set())
+            if _rst_like(l0) and not l1:
+                union(pt_to_cc[pts[1]], vcc_r)
+            elif _rst_like(l1) and not l0:
+                union(pt_to_cc[pts[0]], vcc_r)
+        root_labels = _rebuild_root_labels()
+
+    # Tact switch: two floating terminals → nearer to RST labels joins RST, other → GND
+    if gnd_r is not None and rst_r is not None:
+        rst_xy = label_xy_by_text.get("RST", [])
+        if rst_xy:
+            for sym in symbols:
+                if "SW_Push" not in sym.lib_id:
+                    continue
+                plist = lib_pins.get(sym.lib_id, [])
+                if len(plist) != 2:
+                    continue
+                pts = []
+                for p in plist:
+                    rx, ry = _rot(p.ox, p.oy, sym.rot_deg)
+                    pts.append(_round_pt(sym.x + rx, sym.y - ry))
+                if pts[0] not in pt_to_cc or pts[1] not in pt_to_cc:
+                    continue
+                r0, r1 = find(pt_to_cc[pts[0]]), find(pt_to_cc[pts[1]])
+                l0 = root_labels.get(r0, set())
+                l1 = root_labels.get(r1, set())
+                if l0 or l1:
+                    continue
+                d0 = min(math.hypot(pts[0][0] - x, pts[0][1] - y) for x, y in rst_xy)
+                d1 = min(math.hypot(pts[1][0] - x, pts[1][1] - y) for x, y in rst_xy)
+                if d0 <= d1:
+                    union(pt_to_cc[pts[0]], rst_r)
+                    union(pt_to_cc[pts[1]], gnd_r)
+                else:
+                    union(pt_to_cc[pts[1]], rst_r)
+                    union(pt_to_cc[pts[0]], gnd_r)
+
     # Aggregate by merged group
     group_pins: dict[int, list[tuple[int, str]]] = {}
     group_labels: dict[int, set[str]] = {}
@@ -494,6 +886,21 @@ def kicad_to_schematic_json(in_path: str, out_path: str, scale: float) -> dict[s
 
         pin_spec = [[lp.side, lp.number] for lp in pins]
 
+        # Body top-left in schematic mm (same frame as sym.x/y); pin offsets match KiCad.
+        body_left_mm = sym.x + dx
+        body_top_mm = sym.y + dy
+        pin_xy: list[list[float]] = []
+        for lp in pins:
+            rx, ry = _rot(lp.ox, lp.oy, sym.rot_deg)
+            ax = sym.x + rx
+            ay = sym.y - ry
+            pin_xy.append(
+                [
+                    round((ax - body_left_mm) * scale, 6),
+                    round((ay - body_top_mm) * scale, 6),
+                ]
+            )
+
         label = sym.ref or sym.value or sym.lib_id
         comp = {
             "id": sym.sid,
@@ -507,6 +914,8 @@ def kicad_to_schematic_json(in_path: str, out_path: str, scale: float) -> dict[s
             "pins": pin_spec or [["left", "1"], ["right", "2"]],
             "comment": sym.lib_id,
         }
+        if pin_xy and len(pin_xy) == len(pin_spec):
+            comp["pin_xy"] = pin_xy
         components.append(comp)
 
     # Connections (net fanout -> pairwise chain)
